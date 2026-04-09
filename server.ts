@@ -25,6 +25,9 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
   Message,
+  CreateRoomResponse,
+  ListRoomsResponse,
+  Room,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -38,7 +41,11 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+const BROKER_SCRIPT = (() => {
+  const p = new URL("./broker.ts", import.meta.url).pathname;
+  // Windows: pathname returns "/D:/..." — strip leading slash before drive letter
+  return p.match(/^\/[A-Za-z]:/) ? p.slice(1) : p;
+})();
 
 // --- Broker communication ---
 
@@ -138,6 +145,7 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+const myName: string | undefined = process.env.CLAUDE_PEERS_NAME || undefined;
 
 // --- MCP Server ---
 
@@ -159,6 +167,11 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
+- create_room: Create a chat room for group conversation
+- join_room: Join an existing room by ID
+- leave_room: Leave a room
+- post_room: Post a message to a room
+- list_rooms: List rooms you have joined
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -227,6 +240,79 @@ const TOOLS = [
       properties: {},
     },
   },
+  {
+    name: "create_room",
+    description:
+      "Create a chat room for group conversation between multiple Claude Code instances. Returns the room ID. The creator automatically joins the room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: {
+          type: "string" as const,
+          description: "A short name for the room (e.g. 'design-review', 'standup')",
+        },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "join_room",
+    description:
+      "Join an existing chat room by its ID. You will start receiving messages posted to this room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: {
+          type: "string" as const,
+          description: "The room ID to join",
+        },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "leave_room",
+    description:
+      "Leave a chat room. You will stop receiving messages from this room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: {
+          type: "string" as const,
+          description: "The room ID to leave",
+        },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "post_room",
+    description:
+      "Post a message to a chat room. All members of the room (except you) will receive the message.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: {
+          type: "string" as const,
+          description: "The room ID to post to",
+        },
+        message: {
+          type: "string" as const,
+          description: "The message to post",
+        },
+      },
+      required: ["room_id", "message"],
+    },
+  },
+  {
+    name: "list_rooms",
+    description:
+      "List chat rooms you have joined.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {},
+    },
+  },
 ];
 
 // --- Tool handlers ---
@@ -268,6 +354,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
+          if (p.name) parts.push(`Name: ${p.name}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
@@ -394,6 +481,178 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "create_room": {
+      const { name: roomName } = args as { name: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<CreateRoomResponse>("/create-room", {
+          name: roomName,
+        });
+        // Auto-join the creator
+        await brokerFetch("/join-room", { room_id: result.room_id, peer_id: myId });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Room created and joined: "${result.name}" (ID: ${result.room_id})`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error creating room: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "join_room": {
+      const { room_id } = args as { room_id: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/join-room", {
+          room_id,
+          peer_id: myId,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to join: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Joined room ${room_id}` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error joining room: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "leave_room": {
+      const { room_id } = args as { room_id: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        await brokerFetch("/leave-room", { room_id, peer_id: myId });
+        return {
+          content: [{ type: "text" as const, text: `Left room ${room_id}` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error leaving room: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "post_room": {
+      const { room_id, message } = args as { room_id: string; message: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/post-room", {
+          room_id,
+          from_id: myId,
+          message,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to post: ${result.error}` }],
+            isError: true,
+          };
+        }
+        return {
+          content: [{ type: "text" as const, text: `Message posted to room ${room_id}` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error posting to room: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "list_rooms": {
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<ListRoomsResponse>("/list-rooms", {
+          peer_id: myId,
+        });
+        if (result.rooms.length === 0) {
+          return {
+            content: [{ type: "text" as const, text: "You have not joined any rooms." }],
+          };
+        }
+        const lines = result.rooms.map(
+          (r) => `  ${r.room_id}: "${r.name}" (created ${r.created_at})`
+        );
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Joined rooms (${result.rooms.length}):\n${lines.join("\n")}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error listing rooms: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -401,47 +660,95 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 
 // --- Polling loop for inbound messages ---
 
+// Cache of peer info to avoid redundant lookups within a single poll cycle
+async function lookupSender(senderId: string): Promise<{ summary: string; cwd: string }> {
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", {
+      scope: "machine",
+      cwd: myCwd,
+      git_root: myGitRoot,
+    });
+    const sender = peers.find((p) => p.id === senderId);
+    if (sender) {
+      return { summary: sender.summary, cwd: sender.cwd };
+    }
+  } catch {
+    // Non-critical
+  }
+  return { summary: "", cwd: "" };
+}
+
+// Track successfully pushed message IDs to ack on next poll
+let pendingDmAcks: number[] = [];
+let pendingRoomAcks: number[] = [];
+
 async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Poll DMs — piggyback ack of previous batch
+    const dmResult = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+      id: myId,
+      ack_ids: pendingDmAcks,
+    });
+    pendingDmAcks = [];
 
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
+    for (const msg of dmResult.messages) {
       try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
+        const { summary: fromSummary, cwd: fromCwd } = await lookupSender(msg.from_id);
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+        pendingDmAcks.push(msg.id);
+        log(`Pushed DM from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } catch (e) {
+        log(`Failed to push DM ${msg.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
+
+    // Poll room messages — piggyback ack of previous batch
+    const roomResult = await brokerFetch<PollMessagesResponse>("/poll-room-messages", {
+      peer_id: myId,
+      ack_ids: pendingRoomAcks,
+    });
+    pendingRoomAcks = [];
+
+    for (const msg of roomResult.messages) {
+      try {
+        const delay = Math.floor(Math.random() * 2000) + 500; // 0.5-2.5s random delay
+        await new Promise((r) => setTimeout(r, delay));
+
+        // Room messages: speaker name is already in the message body ([name] ...),
+        // so skip from_summary and from_cwd to reduce context consumption
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              room_id: msg.room_id,
+            },
+          },
+        });
+
+        pendingRoomAcks.push(msg.id);
+        log(`Pushed room msg from ${msg.from_id} in ${msg.room_id}: ${msg.text.slice(0, 80)}`);
+      } catch (e) {
+        log(`Failed to push room msg ${msg.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
   } catch (e) {
     // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
@@ -493,10 +800,11 @@ async function main() {
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
+    name: myName,
     summary: initialSummary,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  log(`Registered as peer ${myId}${myName ? ` (name: ${myName})` : ""}`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
